@@ -23,6 +23,8 @@ struct Config {
     token: String,
     #[serde(default)]
     owner_id: i64,
+    #[serde(default)]
+    allowed_usernames: Vec<String>,
 }
 
 fn configuration() -> Result<(Config, PathBuf)> {
@@ -88,23 +90,28 @@ async fn handle(worker: &Worker, update: &Value) -> Result<()> {
             message["text"].as_str().unwrap_or("").trim(),
         )
     };
-    if actor["id"].as_i64() != Some(worker.api.owner)
-        || message["chat"]["id"].as_i64() != Some(worker.api.owner)
+    let Some(chat_id) = actor["id"].as_i64() else {
+        return Ok(());
+    };
+    if message["chat"]["id"].as_i64() != Some(chat_id)
+        || message["chat"]["type"].as_str() != Some("private")
+        || !worker
+            .store
+            .authorize(chat_id, actor["username"].as_str())?
     {
         return Ok(());
     }
+    let api = worker.api.for_chat(chat_id);
     if callback.is_object() {
-        worker
-            .api
-            .telegram(
-                "answerCallbackQuery",
-                json!({"callback_query_id":callback["id"]}),
-            )
-            .await?;
+        api.telegram(
+            "answerCallbackQuery",
+            json!({"callback_query_id":callback["id"]}),
+        )
+        .await?;
     }
     match command {
-        "/start" | "/help" => menu(&worker.api).await?,
-        "/latest" => show_news(&worker.api, "all", None).await?,
+        "/start" | "/help" => menu(&api).await?,
+        "/latest" => show_news(&api, "all", None).await?,
         "/channels" | "channels" => {
             let buttons = CHANNELS
                 .iter()
@@ -114,31 +121,24 @@ async fn handle(worker: &Worker, update: &Value) -> Result<()> {
                 .chunks(3)
                 .map(|row| row.to_vec())
                 .collect::<Vec<_>>();
-            worker
-                .api
-                .send("选择要查看的频道".into(), json!(rows))
-                .await?;
+            api.send("选择要查看的频道".into(), json!(rows)).await?;
         }
         "/pause" => {
-            worker.store.set("paused", &true)?;
-            worker
-                .api
-                .send(
-                    "自动推送已暂停。发送 /resume 可恢复并补发积压快讯。".into(),
-                    Value::Null,
-                )
-                .await?;
+            worker.store.set_paused(chat_id, true)?;
+            api.send(
+                "自动推送已暂停。发送 /resume 可恢复并补发积压快讯。".into(),
+                Value::Null,
+            )
+            .await?;
         }
         "/resume" => {
-            worker.store.set("paused", &false)?;
-            worker
-                .api
-                .send("自动推送已恢复，正在补发积压快讯。".into(), Value::Null)
+            worker.store.set_paused(chat_id, false)?;
+            api.send("自动推送已恢复，正在补发积压快讯。".into(), Value::Null)
                 .await?;
         }
         "/status" => {
-            let (pending, sent) = worker.store.counts()?;
-            let mode = if worker.store.get::<bool>("paused")?.unwrap_or(false) {
+            let (pending, sent) = worker.store.counts(chat_id)?;
+            let mode = if worker.store.paused(chat_id)? {
                 "已暂停，恢复后补发"
             } else {
                 "推送已开启"
@@ -153,18 +153,18 @@ async fn handle(worker: &Worker, update: &Value) -> Result<()> {
                 .context("Invalid sync timestamp")?
                 .with_timezone(&chrono::FixedOffset::east_opt(7 * 3600).unwrap())
                 .format("%m月%d日 %H:%M:%S");
-            worker.api.send(format!("<b>Rust 实时推送状态</b>\n\n{mode}\n主频道 WebSocket {connected}\n12 个频道每 10 秒同步\n最近同步 {last_sync} UTC+7\n待发送 {pending} 条，近 30 天已发送 {sent} 条"), Value::Null).await?;
+            api.send(format!("<b>Rust 实时推送状态</b>\n\n{mode}\n主频道 WebSocket {connected}\n12 个频道每 10 秒同步\n最近同步 {last_sync} UTC+7\n待发送 {pending} 条，近 30 天已发送 {sent} 条"), Value::Null).await?;
         }
         _ => {
             if let Some(channel) = command.strip_prefix("news:") {
                 if channel == "all" || CHANNELS.iter().any(|(id, _)| *id == channel) {
-                    show_news(&worker.api, channel, None).await?;
+                    show_news(&api, channel, None).await?;
                 }
             } else if let Some(query) = command.strip_prefix("/search ") {
                 let query = query.chars().take(200).collect::<String>();
-                show_news(&worker.api, "all", Some(&query)).await?;
+                show_news(&api, "all", Some(&query)).await?;
             } else {
-                menu(&worker.api).await?;
+                menu(&api).await?;
             }
         }
     }
@@ -184,10 +184,19 @@ async fn commands(worker: Arc<Worker>) -> Result<()> {
                 for update in updates.as_array().context("Invalid Telegram updates")? {
                     if let Err(error) = handle(&worker, update).await {
                         tracing::warn!(%error, "Command failed");
-                        worker
-                            .api
-                            .send("这次查询未完成，请稍后重试。".into(), Value::Null)
-                            .await?;
+                        let message = update
+                            .get("message")
+                            .unwrap_or(&update["callback_query"]["message"]);
+                        if let Some(chat_id) = message["chat"]["id"].as_i64()
+                            && message["chat"]["type"] == "private"
+                            && worker.store.authorize(chat_id, None)?
+                        {
+                            let _ = worker
+                                .api
+                                .for_chat(chat_id)
+                                .send("这次查询未完成，请稍后重试。".into(), Value::Null)
+                                .await;
+                        }
                     }
                     offset = update["update_id"].as_i64().context("Missing update ID")? + 1;
                     worker.store.set("telegram_offset", &offset)?;
@@ -247,6 +256,20 @@ async fn main() -> Result<()> {
         return configure(&api).await;
     }
     let store = Store::open(&state_dir.join("delivery-rust.sqlite3"))?;
+    store.configure_recipients(config.owner_id, &config.allowed_usernames)?;
+    if mode == "access" {
+        for (username, activated) in store.invitations()? {
+            println!(
+                "@{username}: {}",
+                if activated {
+                    "activated"
+                } else {
+                    "awaiting Start"
+                }
+            );
+        }
+        return Ok(());
+    }
     if mode == "smoke" {
         let mut page = api.news("main", None, None, 1).await?;
         let mut item = page.items.pop().context("No current story")?;
@@ -256,7 +279,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     if mode != "run" {
-        bail!("Supported commands: run, check, configure, smoke");
+        bail!("Supported commands: run, check, configure, smoke, access");
     }
     let lock = fs::OpenOptions::new()
         .write(true)
@@ -290,4 +313,40 @@ async fn main() -> Result<()> {
     }
     drop(lock);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn group_messages_cannot_claim_an_invitation() {
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        store
+            .configure_recipients(100, &["guest_user".into()])
+            .unwrap();
+        let api = Api::new("unused".into(), 100).unwrap();
+        assert_eq!(api.for_chat(200).owner, 200);
+        assert_eq!(api.owner, 100);
+        let worker = Worker::new(api, store);
+        handle(
+            &worker,
+            &json!({"message": {"from": {"id":200,"username":"guest_user"},
+            "chat":{"id":-1,"type":"group"},"text":"/start"}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            worker.store.invitations().unwrap(),
+            vec![("guest_user".into(), false)]
+        );
+        handle(
+            &worker,
+            &json!({"message": {"from": {"id":300,"username":"someone_else"},
+            "chat":{"id":300,"type":"private"},"text":"/start"}}),
+        )
+        .await
+        .unwrap();
+        assert!(!worker.store.authorize(300, None).unwrap());
+    }
 }

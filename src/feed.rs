@@ -122,26 +122,18 @@ impl Worker {
     }
 
     pub async fn deliver(self: Arc<Self>) -> Result<()> {
-        let mut delay = 2;
         while !self.stop.is_cancelled() {
-            if !self.store.get::<bool>("paused")?.unwrap_or(false)
-                && let Some(item) = self.store.pending()?
-            {
-                // Finish and persist a successful send before responding to shutdown.
-                match self.api.send_story(&item).await {
+            if let Some((chat_id, item)) = self.store.pending()? {
+                // Each recipient has an independent acknowledgement and retry schedule.
+                match self.api.for_chat(chat_id).send_story(&item).await {
                     Ok(message_id) => {
-                        self.store.acknowledge(item.no, message_id)?;
+                        self.store.acknowledge(chat_id, item.no, message_id)?;
                         tracing::info!(story = item.no, message_id, "Story delivered");
-                        delay = 2;
                         continue;
                     }
                     Err(error) => {
-                        tracing::warn!(story=item.no, %error, "Delivery remains queued");
-                        tokio::select! {
-                            _ = self.stop.cancelled() => break,
-                            _ = tokio::time::sleep(Duration::from_secs(delay)) => {},
-                        }
-                        delay = (delay * 2).min(60);
+                        tracing::warn!(story=item.no, %error, "Recipient delivery will retry");
+                        self.store.defer(chat_id, item.no)?;
                     }
                 }
             }

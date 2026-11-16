@@ -129,6 +129,13 @@ pub struct Api {
 }
 
 impl Api {
+    pub fn for_chat(&self, chat_id: i64) -> Self {
+        Self {
+            owner: chat_id,
+            ..self.clone()
+        }
+    }
+
     pub fn new(token: String, owner: i64) -> Result<Self> {
         let client = Client::builder()
             .timeout(Duration::from_secs(40))
