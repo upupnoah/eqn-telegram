@@ -1,0 +1,25 @@
+[Unit]
+Description=Noah EquationNews Telegram realtime feed (Rust)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=noahx
+Group=noahx
+WorkingDirectory=/home/noahx/eqn-telegram
+Environment=EQN_CONFIG_FILE=/home/noahx/.config/eqn-telegram/config.json
+Environment=EQN_STATE_DIR=/home/noahx/.local/state/eqn-telegram
+ExecStart=/home/noahx/eqn-telegram/bin/eqn-telegram run
+Restart=always
+RestartSec=5
+TimeoutStopSec=90
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/noahx/.local/state/eqn-telegram
+
+[Install]
+WantedBy=multi-user.target

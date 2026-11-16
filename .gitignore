@@ -1,0 +1,7 @@
+__pycache__/
+.venv/
+*.sqlite3*
+*.log
+config.json
+offset.json
+target/
