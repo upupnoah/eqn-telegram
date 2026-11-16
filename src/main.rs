@@ -3,7 +3,7 @@ mod feed;
 mod store;
 
 use anyhow::{Context, Result, bail};
-use api::{Api, CHANNELS};
+use api::{Api, CHANNELS, HttpFailure, clip, escape};
 use feed::Worker;
 use fs2::FileExt;
 use serde::Deserialize;
@@ -54,24 +54,62 @@ fn configuration() -> Result<(Config, PathBuf)> {
     Ok((config, state_dir))
 }
 
-async fn menu(api: &Api) -> Result<()> {
-    api.send("<b>Noah 新闻助手 · Rust 实时推送</b>\n\n已接入方程式新闻 12 个频道。\n主频道由 WebSocket 触发，其余频道每 10 秒检查。\n\n/latest 最新三条\n/channels 浏览频道\n/search 关键词\n/pause 暂停推送\n/resume 恢复并补发\n/status 运行状态\n\n时间显示为越南时间 UTC+7。".into(), json!([
-        [{"text":"📰 最新快讯","callback_data":"news:all"},{"text":"📂 12 个频道","callback_data":"channels"}],
-        [{"text":"主频道","callback_data":"news:main"},{"text":"币安公告","callback_data":"news:binance"},{"text":"韩国交易所","callback_data":"news:korea"}]
+async fn menu(api: &Api, panel: Option<i64>) -> Result<()> {
+    api.panel(panel, "<b>Noah 快讯</b>\n市场新闻、交易所公告与行情异动，覆盖方程式新闻 12 个频道。\n\n按下方按钮浏览快讯，或发送 <code>/search BTC</code> 搜索近 30 天的报道。".into(), json!([
+        [{"text":"最新快讯","callback_data":"news:all"},{"text":"按频道浏览","callback_data":"channels"}],
+        [{"text":"我的推送","callback_data":"status"}]
     ])).await?;
     Ok(())
 }
 
-async fn show_news(api: &Api, channel: &str, query: Option<&str>) -> Result<()> {
+async fn show_news(
+    api: &Api,
+    panel: Option<i64>,
+    channel: &str,
+    query: Option<&str>,
+) -> Result<()> {
     let page = api.news(channel, query, None, 3).await?;
+    let heading = match query {
+        Some(query) => format!("搜索 · {}", escape(&clip(query, 60))),
+        None => CHANNELS
+            .iter()
+            .find(|(id, _)| *id == channel)
+            .map(|(_, name)| format!("{name} · 最新快讯"))
+            .unwrap_or_else(|| "最新快讯".into()),
+    };
+    let mut text = format!("<b>{heading}</b>");
+    let mut links = Vec::new();
+    for (index, story) in page.items.iter().enumerate() {
+        let time = chrono::DateTime::parse_from_rfc3339(&story.time)?
+            .with_timezone(&chrono::FixedOffset::east_opt(7 * 3600).unwrap());
+        text.push_str(&format!(
+            "\n\n<i>{} · {} UTC+7</i>\n{}",
+            story.label(),
+            time.format("%m/%d %H:%M"),
+            escape(&clip(story.headline(), 180))
+        ));
+        if let Some(url) = story.article_url() {
+            links.push(json!({"text":format!("第 {} 条全文",index+1),"url":url}));
+        }
+    }
     if page.items.is_empty() {
-        api.send("该频道或关键词暂时没有可用快讯。".into(), Value::Null)
-            .await?;
+        text.push_str("\n\n暂无匹配快讯，可以换个关键词或浏览其他频道。");
     }
-    for item in page.items {
-        api.send_story(&item).await?;
+    let mut buttons = Vec::new();
+    if !links.is_empty() {
+        buttons.push(links);
     }
+    buttons.push(vec![json!({"text":"浏览频道","callback_data":"channels"})]);
+    api.panel(panel, text, json!(buttons)).await?;
     Ok(())
+}
+
+fn elapsed(ms: i64) -> String {
+    if ms < 1000 {
+        format!("{ms} 毫秒")
+    } else {
+        format!("{:.1} 秒", ms as f64 / 1000.)
+    }
 }
 
 async fn handle(worker: &Worker, update: &Value) -> Result<()> {
@@ -109,62 +147,123 @@ async fn handle(worker: &Worker, update: &Value) -> Result<()> {
         )
         .await?;
     }
+    let panel = callback
+        .get("message")
+        .and_then(|m| m["message_id"].as_i64());
     match command {
-        "/start" | "/help" => menu(&api).await?,
-        "/latest" => show_news(&api, "all", None).await?,
+        "/start" | "/help" | "menu" => menu(&api, panel).await?,
+        "/latest" => show_news(&api, panel, "all", None).await?,
         "/channels" | "channels" => {
             let buttons = CHANNELS
                 .iter()
                 .map(|(id, label)| json!({"text":label,"callback_data":format!("news:{id}")}))
                 .collect::<Vec<_>>();
-            let rows = buttons
+            let mut rows = buttons
                 .chunks(3)
                 .map(|row| row.to_vec())
                 .collect::<Vec<_>>();
-            api.send("选择要查看的频道".into(), json!(rows)).await?;
+            rows.push(vec![json!({"text":"返回菜单","callback_data":"menu"})]);
+            api.panel(
+                panel,
+                "<b>频道目录</b>\n选择频道，查看最近三条快讯。".into(),
+                json!(rows),
+            )
+            .await?;
         }
-        "/pause" => {
+        "/pause" | "pause" => {
             worker.store.set_paused(chat_id, true)?;
-            api.send(
-                "自动推送已暂停。发送 /resume 可恢复并补发积压快讯。".into(),
+            api.panel(
+                panel,
+                "<b>推送已暂停</b>\n新快讯会保留，恢复后将自动补发。".into(),
+                json!([[{"text":"恢复推送","callback_data":"resume"}]]),
+            )
+            .await?;
+        }
+        "/resume" | "resume" => {
+            worker.store.set_paused(chat_id, false)?;
+            worker.delivery_ready.notify_one();
+            api.panel(
+                panel,
+                "<b>推送已恢复</b>\n待发快讯将自动补发。".into(),
+                json!([[{"text":"查看状态","callback_data":"status"}]]),
+            )
+            .await?;
+        }
+        "/status" | "status" => {
+            let (pending, sent, failed) = worker.store.counts(chat_id)?;
+            let paused = worker.store.paused(chat_id)?;
+            let mode = if paused { "已暂停" } else { "已开启" };
+            let connected = if worker.connected.load(Ordering::Relaxed) {
+                "已连接"
+            } else {
+                "正在重连"
+            };
+            let stamp = worker.last_sync.load(Ordering::Relaxed);
+            let age = chrono::Utc::now().timestamp().saturating_sub(stamp).max(0);
+            let sync = if stamp == 0 {
+                "正在首次同步".to_owned()
+            } else if age > 15 {
+                format!("已延迟 · {age} 秒前同步")
+            } else {
+                format!("{age} 秒前同步")
+            };
+            let mut text = format!(
+                "<b>我的推送 · {mode}</b>\n待发 {pending} 条　·　近 30 天已发 {sent} 条\n\n<b>数据连接</b>\n主频道　{connected}\n全频道　{sync}"
+            );
+            if let Some((queue, total)) = worker.store.recent_latency(chat_id)? {
+                text.push_str(&format!(
+                    "\n\n<b>最近一次投递</b>\n入队至确认　{}\n发布至确认　{}",
+                    elapsed(queue),
+                    elapsed(total)
+                ));
+            }
+            let action = if paused {
+                ("恢复推送", "resume")
+            } else {
+                ("暂停推送", "pause")
+            };
+            let mut buttons = vec![vec![
+                json!({"text":action.0,"callback_data":action.1}),
+                json!({"text":"刷新状态","callback_data":"status"}),
+            ]];
+            if failed > 0 {
+                text.push_str(&format!(
+                    "\n\n有 {failed} 条消息被 Telegram 拒收，可手动重试。"
+                ));
+                buttons.push(vec![
+                    json!({"text":"重试失败消息","callback_data":"retry_failed"}),
+                ]);
+            }
+            api.panel(panel, text, json!(buttons)).await?;
+        }
+        "retry_failed" => {
+            let count = worker.store.retry_failed(chat_id)?;
+            worker.delivery_ready.notify_one();
+            api.panel(
+                panel,
+                format!("已将 {count} 条快讯放回待发队列。"),
                 Value::Null,
             )
             .await?;
         }
-        "/resume" => {
-            worker.store.set_paused(chat_id, false)?;
-            api.send("自动推送已恢复，正在补发积压快讯。".into(), Value::Null)
-                .await?;
-        }
-        "/status" => {
-            let (pending, sent) = worker.store.counts(chat_id)?;
-            let mode = if worker.store.paused(chat_id)? {
-                "已暂停，恢复后补发"
-            } else {
-                "推送已开启"
-            };
-            let connected = if worker.connected.load(Ordering::Relaxed) {
-                "已连接"
-            } else {
-                "重连中，定时检查继续运行"
-            };
-            let timestamp = worker.last_sync.load(Ordering::Relaxed);
-            let last_sync = chrono::DateTime::from_timestamp(timestamp, 0)
-                .context("Invalid sync timestamp")?
-                .with_timezone(&chrono::FixedOffset::east_opt(7 * 3600).unwrap())
-                .format("%m月%d日 %H:%M:%S");
-            api.send(format!("<b>Rust 实时推送状态</b>\n\n{mode}\n主频道 WebSocket {connected}\n12 个频道每 10 秒同步\n最近同步 {last_sync} UTC+7\n待发送 {pending} 条，近 30 天已发送 {sent} 条"), Value::Null).await?;
+        "/search" => {
+            api.panel(
+                panel,
+                "<b>搜索快讯</b>\n在命令后加上关键词，例如 <code>/search BTC</code>。".into(),
+                Value::Null,
+            )
+            .await?;
         }
         _ => {
             if let Some(channel) = command.strip_prefix("news:") {
                 if channel == "all" || CHANNELS.iter().any(|(id, _)| *id == channel) {
-                    show_news(&api, channel, None).await?;
+                    show_news(&api, panel, channel, None).await?;
                 }
             } else if let Some(query) = command.strip_prefix("/search ") {
                 let query = query.chars().take(200).collect::<String>();
-                show_news(&api, "all", Some(&query)).await?;
+                show_news(&api, panel, "all", Some(&query)).await?;
             } else {
-                menu(&api).await?;
+                menu(&api, panel).await?;
             }
         }
     }
@@ -204,10 +303,16 @@ async fn commands(worker: Arc<Worker>) -> Result<()> {
                 delay = 2;
             }
             Err(error) => {
-                tracing::warn!(%error, "Telegram polling will retry");
+                let wait = error
+                    .downcast_ref::<HttpFailure>()
+                    .and_then(|e| e.retry_after)
+                    .unwrap_or(delay)
+                    .max(delay)
+                    .min(86400);
+                tracing::warn!(%error, wait, "Telegram polling will retry");
                 tokio::select! {
                     _ = worker.stop.cancelled() => return Ok(()),
-                    _ = tokio::time::sleep(Duration::from_secs(delay)) => {},
+                    _ = tokio::time::sleep(Duration::from_secs(wait)) => {},
                 }
                 delay = (delay * 2).min(60);
             }
@@ -226,7 +331,7 @@ async fn configure(api: &Api) -> Result<()> {
         ("help", "显示查询菜单"),
     ];
     api.telegram("setMyCommands", json!({"commands":commands.iter().map(|(command,description)| json!({"command":command,"description":description})).collect::<Vec<_>>()})).await?;
-    api.telegram("setMyDescription", json!({"description":"个人中文新闻助手 · Rust 实时推送版。接入方程式新闻 12 个频道，支持最新快讯、关键词查询、暂停和恢复。"})).await?;
+    api.telegram("setMyDescription", json!({"description":"市场新闻、交易所公告与行情异动。订阅方程式新闻 12 个频道的中文快讯，按频道浏览，或用关键词搜索近 30 天的报道。"})).await?;
     Ok(())
 }
 
@@ -274,8 +379,8 @@ async fn main() -> Result<()> {
         let mut page = api.news("main", None, None, 1).await?;
         let mut item = page.items.pop().context("No current story")?;
         item.deployment_test = true;
-        store.commit(&[item], None)?;
-        println!("Deployment verification queued");
+        let message_id = api.send_story(&item).await?;
+        println!("Owner preview confirmed by Telegram: {message_id}");
         return Ok(());
     }
     if mode != "run" {
@@ -302,14 +407,25 @@ async fn main() -> Result<()> {
     tracing::info!("Rust realtime worker started; all 12 channels enabled");
     let result = tokio::select! {
         signal = shutdown_signal() => signal,
-        task = tasks.join_next() => {
-            task.context("No background worker")??.context("Background worker failed")?;
-            Err(anyhow::anyhow!("Background worker exited unexpectedly"))
+        task = tasks.join_next() => match task {
+            Some(Ok(Err(error))) => Err(error.context("Background worker failed")),
+            Some(Err(error)) => Err(error.into()),
+            _ => Err(anyhow::anyhow!("Background worker exited unexpectedly")),
         }
     };
     worker.stop.cancel();
-    while let Some(task) = tasks.join_next().await {
-        task??;
+    let drain = async {
+        while let Some(task) = tasks.join_next().await {
+            task??;
+        }
+        Ok::<_, anyhow::Error>(())
+    };
+    match tokio::time::timeout(Duration::from_secs(45), drain).await {
+        Ok(done) => done?,
+        Err(_) => {
+            tracing::warn!("Shutdown grace period elapsed; unacknowledged items remain queued");
+            tasks.shutdown().await;
+        }
     }
     drop(lock);
     result

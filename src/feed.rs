@@ -1,9 +1,9 @@
 use crate::{
-    api::{Api, Cursor, NewsPage, Story},
+    api::{Api, Cursor, HttpFailure, NewsPage, Story},
     store::Store,
 };
 use anyhow::{Context, Result, bail};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt, stream::FuturesUnordered};
 use std::{
     collections::HashSet,
     future::Future,
@@ -17,11 +17,14 @@ use tokio::{sync::Notify, time::Instant};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
 
+pub const CHECK_SECONDS: u64 = 2;
+
 pub struct Worker {
     pub api: Api,
     pub store: Store,
     pub stop: CancellationToken,
     pub wake: Notify,
+    pub delivery_ready: Notify,
     pub connected: AtomicBool,
     pub last_sync: AtomicI64,
     pub last_pong: AtomicI64,
@@ -68,6 +71,7 @@ impl Worker {
             store,
             stop: CancellationToken::new(),
             wake: Notify::new(),
+            delivery_ready: Notify::new(),
             connected: AtomicBool::new(false),
             last_sync: AtomicI64::new(0),
             last_pong: AtomicI64::new(0),
@@ -86,6 +90,13 @@ impl Worker {
             self.store.set("cursor", &cursor)?;
             tracing::info!("Initial news cursor established");
         }
+        if self.store.get::<Cursor>("overlap_floor")?.is_none() {
+            let cursor = self
+                .store
+                .get::<Cursor>("cursor")?
+                .context("Missing news cursor")?;
+            self.store.set("overlap_floor", &cursor)?;
+        }
         Ok(())
     }
 
@@ -94,52 +105,137 @@ impl Worker {
             .store
             .get::<Cursor>("cursor")?
             .context("Missing news cursor")?;
-        let (items, newest) = collect_news(cursor, |before| {
+        // Re-read a short overlap so a late-indexed item behind the watermark is still seen.
+        let initial = self
+            .store
+            .get::<Cursor>("overlap_floor")?
+            .context("Missing overlap floor")?;
+        let since = Cursor(chrono::Utc::now().timestamp_millis() - 60_000, 0)
+            .min(cursor)
+            .max(initial);
+        let (items, newest) = collect_news(since, |before| {
             let api = self.api.clone();
-            async move { api.news("all", None, before.as_deref(), 50).await }
+            async move { api.news("all", None, before.as_deref(), 12).await }
         })
         .await?;
-        self.store.commit(&items, Some(newest))?;
+        let added = if items.is_empty() {
+            0
+        } else {
+            self.store
+                .commit(&items, (newest > cursor).then_some(newest))?
+        };
+        if added > 0 {
+            self.delivery_ready.notify_one();
+        }
         self.last_sync
             .store(chrono::Utc::now().timestamp(), Ordering::Relaxed);
-        Ok(items.len())
+        Ok(added)
     }
 
     pub async fn ingest(self: Arc<Self>) -> Result<()> {
-        while !self.stop.is_cancelled() {
-            match self.sync_once().await {
-                Ok(count) if count > 0 => tracing::info!(count, "Queued new stories"),
-                Ok(_) => {}
-                Err(error) => tracing::warn!(%error, "News sync will retry"),
+        let mut cleanup = Instant::now();
+        let mut delay = CHECK_SECONDS;
+        let mut follow_up = false;
+        loop {
+            if self.stop.is_cancelled() {
+                break;
             }
-            tokio::select! {
+            if Instant::now() >= cleanup {
+                self.store.prune()?;
+                cleanup = Instant::now() + Duration::from_secs(3600);
+            }
+            let result = tokio::select! {
                 _ = self.stop.cancelled() => break,
-                _ = self.wake.notified() => {},
-                _ = tokio::time::sleep(Duration::from_secs(10)) => {},
+                result = self.sync_once() => result,
+            };
+            let failed = result.is_err();
+            match result {
+                Ok(count) => {
+                    if count > 0 {
+                        tracing::info!(count, "Queued new stories");
+                    }
+                    delay = CHECK_SECONDS;
+                }
+                Err(error) => {
+                    delay = (delay * 2).min(60);
+                    tracing::warn!(%error, delay, "News sync will retry");
+                }
             }
+            // The WebSocket can lead the Chinese index. Check once more after a short delay.
+            let interval = if follow_up && !failed {
+                Duration::from_millis(400)
+            } else {
+                Duration::from_secs(delay)
+            };
+            follow_up = tokio::select! {
+                _ = self.stop.cancelled() => break,
+                _ = self.wake.notified(), if !failed => true,
+                _ = tokio::time::sleep(interval) => false,
+            };
         }
         Ok(())
     }
 
-    pub async fn deliver(self: Arc<Self>) -> Result<()> {
-        while !self.stop.is_cancelled() {
-            if let Some((chat_id, item)) = self.store.pending()? {
-                // Each recipient has an independent acknowledgement and retry schedule.
-                match self.api.for_chat(chat_id).send_story(&item).await {
-                    Ok(message_id) => {
-                        self.store.acknowledge(chat_id, item.no, message_id)?;
-                        tracing::info!(story = item.no, message_id, "Story delivered");
-                        continue;
-                    }
-                    Err(error) => {
-                        tracing::warn!(story=item.no, %error, "Recipient delivery will retry");
-                        self.store.defer(chat_id, item.no)?;
-                    }
+    async fn send_one(&self, chat_id: i64, item: Story) -> Result<i64> {
+        let started = Instant::now();
+        match self.api.for_chat(chat_id).send_story(&item).await {
+            Ok(message_id) => {
+                self.store.acknowledge(chat_id, item.no, message_id)?;
+                let source_age_ms = chrono::Utc::now().timestamp_millis() - item.cursor()?.0;
+                tracing::info!(
+                    story = item.no,
+                    send_ms = started.elapsed().as_millis(),
+                    source_age_ms,
+                    "Story delivered"
+                );
+            }
+            Err(error) => {
+                let http = error.downcast_ref::<HttpFailure>();
+                if http.is_some_and(|e| e.status == 403) {
+                    self.store.set_paused(chat_id, true)?;
+                    tracing::warn!("Telegram refused delivery; subscription paused");
+                } else if http.is_some_and(|e| e.status == 400) {
+                    self.store.quarantine(chat_id, item.no)?;
+                    tracing::warn!(
+                        story = item.no,
+                        "Telegram rejected message; saved for manual retry"
+                    );
+                } else {
+                    self.store
+                        .defer(chat_id, item.no, http.and_then(|e| e.retry_after))?;
+                    tracing::warn!(story=item.no, %error, "Recipient delivery deferred");
                 }
             }
+        }
+        Ok(chat_id)
+    }
+
+    pub async fn deliver(self: Arc<Self>) -> Result<()> {
+        let mut busy = Vec::new();
+        let mut sends = FuturesUnordered::new();
+        loop {
+            while busy.len() < 16 && !self.stop.is_cancelled() {
+                let Some((chat_id, item)) = self.store.pending(&busy)? else {
+                    break;
+                };
+                busy.push(chat_id);
+                sends.push(self.send_one(chat_id, item));
+            }
+            if self.stop.is_cancelled() {
+                while let Some(sent) = sends.next().await {
+                    sent?;
+                }
+                break;
+            }
             tokio::select! {
-                _ = self.stop.cancelled() => break,
-                _ = tokio::time::sleep(Duration::from_millis(250)) => {},
+                result = sends.next(), if !sends.is_empty() => {
+                    let done = result.expect("in-flight delivery")?;
+                    busy.retain(|id| *id != done);
+                },
+                _ = self.stop.cancelled() => {},
+                _ = self.delivery_ready.notified() => {},
+                // Also recover due retries or state written by another process.
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {},
             }
         }
         Ok(())

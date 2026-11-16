@@ -8,7 +8,7 @@ pub struct Store(Mutex<Connection>);
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
-        let db = Connection::open(path)?;
+        let mut db = Connection::open(path)?;
         db.busy_timeout(std::time::Duration::from_secs(10))?;
         db.execute_batch(
             "PRAGMA journal_mode=WAL;
@@ -30,6 +30,18 @@ impl Store {
                 PRIMARY KEY (chat_id, story_id)
             );",
         )?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if tx.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))? == 0 {
+            tx.execute_batch("ALTER TABLE recipient_deliveries ADD COLUMN queued_ms INTEGER;
+                ALTER TABLE recipient_deliveries ADD COLUMN ack_ms INTEGER;
+                ALTER TABLE recipient_deliveries ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE recipient_deliveries ADD COLUMN failed_at INTEGER;
+                CREATE INDEX delivery_due ON recipient_deliveries(next_attempt,story_id,chat_id) WHERE sent_at IS NULL AND failed_at IS NULL;
+                CREATE INDEX delivery_story ON recipient_deliveries(story_id);
+                CREATE INDEX delivery_ack ON recipient_deliveries(chat_id,ack_ms DESC) WHERE ack_ms IS NOT NULL;
+                PRAGMA user_version=1;")?;
+        }
+        tx.commit()?;
         Ok(Self(Mutex::new(db)))
     }
 
@@ -142,16 +154,18 @@ impl Store {
         Ok(())
     }
 
-    pub fn commit(&self, items: &[Story], cursor: Option<Cursor>) -> Result<()> {
+    pub fn commit(&self, items: &[Story], cursor: Option<Cursor>) -> Result<usize> {
         let mut db = self.0.lock().map_err(|_| anyhow!("Database lock failed"))?;
         let tx = db.transaction()?;
+        let mut rows = 0;
         for item in items {
             let inserted = tx.execute(
                 "INSERT OR IGNORE INTO outbox (id,published,payload) VALUES (?1,?2,?3)",
                 params![item.no, item.cursor()?.0, serde_json::to_string(item)?],
             )?;
             if inserted > 0 {
-                tx.execute("INSERT INTO recipient_deliveries (chat_id,story_id) SELECT chat_id,?1 FROM subscribers", [item.no])?;
+                rows += 1;
+                tx.execute("INSERT INTO recipient_deliveries (chat_id,story_id,queued_ms) SELECT chat_id,?1,?2 FROM subscribers", params![item.no,chrono::Utc::now().timestamp_millis()])?;
             }
         }
         if let Some(cursor) = cursor {
@@ -160,6 +174,13 @@ impl Store {
                 [serde_json::to_string(&cursor)?],
             )?;
         }
+        tx.commit()?;
+        Ok(rows)
+    }
+
+    pub fn prune(&self) -> Result<()> {
+        let mut db = self.0.lock().map_err(|_| anyhow!("Database lock failed"))?;
+        let tx = db.transaction()?;
         tx.execute(
             "DELETE FROM recipient_deliveries WHERE sent_at < unixepoch() - 2592000",
             [],
@@ -169,15 +190,16 @@ impl Store {
         Ok(())
     }
 
-    pub fn pending(&self) -> Result<Option<(i64, Story)>> {
+    pub fn pending(&self, busy: &[i64]) -> Result<Option<(i64, Story)>> {
         let db = self.0.lock().map_err(|_| anyhow!("Database lock failed"))?;
         let value: Option<(i64, String)> = db
             .query_row(
                 "SELECT d.chat_id,o.payload FROM recipient_deliveries d
                  JOIN outbox o ON o.id=d.story_id JOIN subscribers s ON s.chat_id=d.chat_id
-                 WHERE d.sent_at IS NULL AND s.paused=0 AND d.next_attempt<=unixepoch()
+                 WHERE d.sent_at IS NULL AND d.failed_at IS NULL AND s.paused=0 AND d.next_attempt<=unixepoch()
+                 AND d.chat_id NOT IN (SELECT value FROM json_each(?1))
                  ORDER BY d.next_attempt,o.published,o.id,d.chat_id LIMIT 1",
-                [],
+                [serde_json::to_string(busy)?],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
@@ -189,22 +211,47 @@ impl Store {
     pub fn acknowledge(&self, chat_id: i64, id: i64, telegram_id: i64) -> Result<()> {
         let db = self.0.lock().map_err(|_| anyhow!("Database lock failed"))?;
         db.execute(
-            "UPDATE recipient_deliveries SET sent_at=unixepoch(),telegram_id=?3 WHERE story_id=?2 AND chat_id=?1",
-            params![chat_id, id, telegram_id],
+            "UPDATE recipient_deliveries SET sent_at=unixepoch(),telegram_id=?3,ack_ms=?4 WHERE story_id=?2 AND chat_id=?1",
+            params![chat_id, id, telegram_id,chrono::Utc::now().timestamp_millis()],
         )?;
         Ok(())
     }
 
-    pub fn defer(&self, chat_id: i64, id: i64) -> Result<()> {
+    pub fn defer(&self, chat_id: i64, id: i64, retry_after: Option<u64>) -> Result<()> {
         let db = self.0.lock().map_err(|_| anyhow!("Database lock failed"))?;
-        db.execute("UPDATE recipient_deliveries SET next_attempt=unixepoch()+60 WHERE chat_id=?1 AND story_id=?2", params![chat_id,id])?;
+        db.execute("UPDATE recipient_deliveries SET attempts=attempts+1,next_attempt=unixepoch()+coalesce(?3,min(300,2 << min(attempts,8))) WHERE chat_id=?1 AND story_id=?2", params![chat_id,id,retry_after.map(|v| v.clamp(1,86400))])?;
         Ok(())
     }
 
-    pub fn counts(&self, chat_id: i64) -> Result<(i64, i64)> {
+    pub fn quarantine(&self, chat_id: i64, story: i64) -> Result<()> {
         let db = self.0.lock().map_err(|_| anyhow!("Database lock failed"))?;
-        Ok(db.query_row("SELECT count(*) FILTER(WHERE sent_at IS NULL), count(*) FILTER(WHERE sent_at IS NOT NULL) FROM recipient_deliveries WHERE chat_id=?1",
-            [chat_id], |r| Ok((r.get(0)?, r.get(1)?)))?)
+        db.execute("UPDATE recipient_deliveries SET failed_at=unixepoch() WHERE chat_id=?1 AND story_id=?2",params![chat_id,story])?;
+        Ok(())
+    }
+
+    pub fn retry_failed(&self, chat_id: i64) -> Result<usize> {
+        let db = self.0.lock().map_err(|_| anyhow!("Database lock failed"))?;
+        Ok(db.execute("UPDATE recipient_deliveries SET failed_at=NULL,next_attempt=0,attempts=0 WHERE chat_id=?1 AND failed_at IS NOT NULL",[chat_id])?)
+    }
+
+    pub fn recent_latency(&self, chat_id: i64) -> Result<Option<(i64, i64)>> {
+        let db = self.0.lock().map_err(|_| anyhow!("Database lock failed"))?;
+        Ok(db
+            .query_row(
+                "SELECT max(0,d.ack_ms-d.queued_ms),max(0,d.ack_ms-o.published)
+            FROM recipient_deliveries d JOIN outbox o ON o.id=d.story_id
+            WHERE d.chat_id=?1 AND d.ack_ms IS NOT NULL AND d.queued_ms IS NOT NULL
+            ORDER BY d.ack_ms DESC LIMIT 1",
+                [chat_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    pub fn counts(&self, chat_id: i64) -> Result<(i64, i64, i64)> {
+        let db = self.0.lock().map_err(|_| anyhow!("Database lock failed"))?;
+        Ok(db.query_row("SELECT count(*) FILTER(WHERE sent_at IS NULL AND failed_at IS NULL), count(*) FILTER(WHERE sent_at >= unixepoch()-2592000), count(*) FILTER(WHERE failed_at IS NOT NULL) FROM recipient_deliveries WHERE chat_id=?1",
+            [chat_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?)
     }
 }
 
@@ -227,17 +274,17 @@ mod tests {
         store
             .commit(&[story(2), story(1), story(1)], Some(Cursor(0, 2)))
             .unwrap();
-        assert_eq!(store.counts(100).unwrap(), (2, 0));
-        assert_eq!(store.pending().unwrap().unwrap().1.no, 1);
+        assert_eq!(store.counts(100).unwrap(), (2, 0, 0));
+        assert_eq!(store.pending(&[]).unwrap().unwrap().1.no, 1);
         store.acknowledge(100, 1, 101).unwrap();
         store.set_paused(100, true).unwrap();
         drop(store);
         let store = Store::open(&path).unwrap();
         store.configure_recipients(100, &[]).unwrap();
-        assert_eq!(store.counts(100).unwrap(), (1, 1));
-        assert!(store.pending().unwrap().is_none());
+        assert_eq!(store.counts(100).unwrap(), (1, 1, 0));
+        assert!(store.pending(&[]).unwrap().is_none());
         store.set_paused(100, false).unwrap();
-        assert_eq!(store.pending().unwrap().unwrap().1.no, 2);
+        assert_eq!(store.pending(&[]).unwrap().unwrap().1.no, 2);
         assert!(!store.paused(100).unwrap());
     }
 
@@ -253,7 +300,7 @@ mod tests {
                 .commit(&[story(2), invalid], Some(Cursor(0, 3)))
                 .is_err()
         );
-        assert_eq!(store.counts(100).unwrap(), (0, 0));
+        assert_eq!(store.counts(100).unwrap(), (0, 0, 0));
         assert_eq!(store.get::<Cursor>("cursor").unwrap(), Some(Cursor(0, 1)));
     }
 
@@ -261,7 +308,7 @@ mod tests {
     fn formatting_escapes_untrusted_html() {
         let formatted = story(1).formatted().unwrap();
         assert!(formatted.contains("test &lt;tag&gt;"));
-        assert!(formatted.contains("07:00 UTC+7"));
+        assert!(formatted.contains("07:00:00 UTC+7"));
     }
 
     #[test]
@@ -289,19 +336,58 @@ mod tests {
             .unwrap();
         store.commit(&[story(1)], None).unwrap();
         assert!(store.authorize(200, Some("guest_user")).unwrap());
-        assert_eq!(store.counts(200).unwrap(), (0, 0));
+        assert_eq!(store.counts(200).unwrap(), (0, 0, 0));
         store.commit(&[story(1), story(2)], None).unwrap();
-        assert_eq!(store.counts(100).unwrap(), (2, 0));
-        assert_eq!(store.counts(200).unwrap(), (1, 0));
+        assert_eq!(store.counts(100).unwrap(), (2, 0, 0));
+        assert_eq!(store.counts(200).unwrap(), (1, 0, 0));
         store.set_paused(100, true).unwrap();
         assert!(!store.paused(200).unwrap());
-        assert_eq!(store.pending().unwrap().unwrap().0, 200);
-        store.defer(200, 2).unwrap();
+        assert_eq!(store.pending(&[]).unwrap().unwrap().0, 200);
+        store.defer(200, 2, None).unwrap();
         store.set_paused(100, false).unwrap();
-        assert_eq!(store.pending().unwrap().unwrap().0, 100);
+        assert_eq!(store.pending(&[]).unwrap().unwrap().0, 100);
         store.acknowledge(100, 2, 123).unwrap();
-        assert_eq!(store.counts(100).unwrap(), (1, 1));
-        assert_eq!(store.counts(200).unwrap(), (1, 0));
+        assert_eq!(store.counts(100).unwrap(), (1, 1, 0));
+        assert_eq!(store.counts(200).unwrap(), (1, 0, 0));
+    }
+
+    #[test]
+    fn concurrent_lanes_and_retry_state_survive_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delivery.db");
+        let store = Store::open(&path).unwrap();
+        store.configure_recipients(100, &["reader".into()]).unwrap();
+        store.authorize(200, Some("reader")).unwrap();
+        store.commit(&[story(1), story(2)], None).unwrap();
+        assert_eq!(store.pending(&[100]).unwrap().unwrap().0, 200);
+        assert!(store.pending(&[100, 200]).unwrap().is_none());
+        store.defer(200, 1, Some(120)).unwrap();
+        store.quarantine(100, 1).unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.counts(100).unwrap(), (1, 0, 1));
+        assert_eq!(store.pending(&[100]).unwrap().unwrap().1.no, 2);
+        assert_eq!(store.pending(&[200]).unwrap().unwrap().1.no, 2);
+        assert_eq!(store.retry_failed(200).unwrap(), 0);
+        assert_eq!(store.retry_failed(100).unwrap(), 1);
+        store.acknowledge(100, 1, 99).unwrap();
+        assert!(store.recent_latency(100).unwrap().is_some());
+        assert!(store.recent_latency(200).unwrap().is_none());
+    }
+
+    #[test]
+    fn late_indexed_story_is_delivered_once_without_rewinding_cursor() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        store.configure_recipients(100, &[]).unwrap();
+        let high = story(3);
+        let cursor = high.cursor().unwrap();
+        store
+            .commit(std::slice::from_ref(&high), Some(cursor))
+            .unwrap();
+        assert_eq!(store.commit(&[story(2), high.clone()], None).unwrap(), 1);
+        assert_eq!(store.commit(&[story(2), high], None).unwrap(), 0);
+        assert_eq!(store.get::<Cursor>("cursor").unwrap(), Some(cursor));
+        assert_eq!(store.counts(100).unwrap(), (2, 0, 0));
     }
 
     #[test]
@@ -323,11 +409,11 @@ mod tests {
         store.set("paused", &true).unwrap();
         store.configure_recipients(100, &[]).unwrap();
         assert!(store.paused(100).unwrap());
-        assert_eq!(store.counts(100).unwrap(), (1, 1));
+        assert_eq!(store.counts(100).unwrap(), (1, 1, 0));
         store.acknowledge(100, 2, 124).unwrap();
         store.set_paused(100, false).unwrap();
         store.configure_recipients(100, &[]).unwrap();
         assert!(!store.paused(100).unwrap());
-        assert_eq!(store.counts(100).unwrap(), (0, 2));
+        assert_eq!(store.counts(100).unwrap(), (0, 2, 0));
     }
 }
